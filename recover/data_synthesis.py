@@ -15,12 +15,24 @@ import torchvision.models as models
 from PIL import Image
 from torchvision import transforms
 from utils import *
+from torch.utils.data import Dataset
 
+class TensorDataset(Dataset):
+    def __init__(self, images, labels): # images: n x c x h x w tensor
+        self.images = images.detach().float()
+        self.labels = labels.detach()
 
+    def __getitem__(self, index):
+        return self.images[index], self.labels[index]
+
+    def __len__(self):
+        return self.images.shape[0]
+    
+    
 def get_images(args, model_teacher, hook_for_display, ipc_id):
     print("get_images call")
     save_every = 100
-    batch_size = args.batch_size
+    #batch_size = args.batch_size
 
     best_cost = 1e4
 
@@ -31,88 +43,169 @@ def get_images(args, model_teacher, hook_for_display, ipc_id):
 
     # setup target labels
     # targets_all = torch.LongTensor(np.random.permutation(1000))
-    targets_all = torch.LongTensor(np.arange(1000))
+    # targets_all = torch.LongTensor(np.arange(1000))
 
-    for kk in range(0, 1000, batch_size):
-        targets = targets_all[kk:min(kk+batch_size,1000)].to('cuda')
+    #load data real and syn
 
-        data_type = torch.float
-        inputs = torch.randn((targets.shape[0], 3, 224, 224), requires_grad=True, device='cuda',
-                             dtype=data_type)
+    #real
+    channel = 3
+    im_size = (64, 64)
+    num_classes = 200
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    data = torch.load(os.path.join('../', 'tinyimagenet.pt'), map_location='cpu')
 
-        iterations_per_layer = args.iteration
-        lim_0, lim_1 = args.jitter , args.jitter
+    class_names = data['classes']
 
-        optimizer = optim.Adam([inputs], lr=args.lr, betas=[0.5, 0.9], eps = 1e-8)
-        lr_scheduler = lr_cosine_policy(args.lr, 0, iterations_per_layer) # 0 - do not use warmup
-        criterion = nn.CrossEntropyLoss()
-        criterion = criterion.cuda()
+    images_train = data['images_train']
+    labels_train = data['labels_train']
+    images_train = images_train.detach().float() / 255.0
+    labels_train = labels_train.detach()
+    for c in range(channel):
+        images_train[:,c] = (images_train[:,c] - mean[c])/std[c]
+    dst_train = TensorDataset(images_train, labels_train)  # no augmentation
+    args.device = torch.device('cuda')
 
-        for iteration in range(iterations_per_layer):
-            # learning rate scheduling
-            lr_scheduler(optimizer, iteration, iteration)
+    # 不用val
+    # images_val = data['images_val']
+    # labels_val = data['labels_val']
+    # images_val = images_val.detach().float() / 255.0
+    # labels_val = labels_val.detach()
 
-            aug_function = transforms.Compose([
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-            ])
-            inputs_jit = aug_function(inputs)
+    # for c in range(channel):
+    #     images_val[:, c] = (images_val[:, c] - mean[c]) / std[c]
+
+    # dst_test = TensorDataset(images_val, labels_val)  # no augmentation
+    ''' organize the real dataset '''
+    images_all = []
+    labels_all = []
+    indices_class = [[] for c in range(num_classes)]
+
+    images_all = [torch.unsqueeze(dst_train[i][0], dim=0) for i in range(len(dst_train))]
+    labels_all = [dst_train[i][1] for i in range(len(dst_train))]
+    for i, lab in enumerate(labels_all):
+        indices_class[lab].append(i)
+    images_all = torch.cat(images_all, dim=0).to(args.device)
+    labels_all = torch.tensor(labels_all, dtype=torch.long, device=args.device)
+    args.ipc = 50
+    ''' initialize the synthetic data '''
+    image_syn = torch.randn(size=(num_classes*args.ipc, channel, im_size[0], im_size[1]), dtype=torch.float, requires_grad=True, device=args.device)
+    label_syn = torch.tensor([np.ones(args.ipc)*i for i in range(num_classes)], dtype=torch.long, requires_grad=False, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
+
+    real_batch = 200
+    #去掉循环
+    #for kk in range(0, 1000, batch_size):
+    #targets = targets_all[kk:min(kk+batch_size,1000)].to('cuda')
+
+    data_type = torch.float
+    # inputs = torch.randn((targets.shape[0], 3, 224, 224), requires_grad=True, device='cuda',
+    #                      dtype=data_type)
+
+    iterations_per_layer = args.iteration
+    lim_0, lim_1 = args.jitter , args.jitter
+
+    optimizer = optim.Adam([image_syn], lr=args.lr, betas=[0.5, 0.9], eps = 1e-8)
+    lr_scheduler = lr_cosine_policy(args.lr, 0, iterations_per_layer) # 0 - do not use warmup
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.cuda()
+
+    for iteration in range(iterations_per_layer):
+        # learning rate scheduling
+        lr_scheduler(optimizer, iteration, iteration)
+
+        aug_function = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+        ])
+        loss_ce,loss_fm,loss_bn = torch.tensor(0.0).cuda()
+
+        for c in range(num_classes):
+            idx_shuffle = np.random.permutation(indices_class[c])[:real_batch]
+            img_real = images_all[idx_shuffle]
+
+            img_syn = image_syn[c*args.ipc:(c+1)*args.ipc].reshape((args.ipc, channel, im_size[0], im_size[1]))
+
+            syn_jit = aug_function(img_syn)
+            real_jit = aug_function(img_real)
 
             # apply random jitter offsets
             off1 = random.randint(0, lim_0)
             off2 = random.randint(0, lim_1)
-            inputs_jit = torch.roll(inputs_jit, shifts=(off1, off2), dims=(2, 3))
-
+            syn_jit = torch.roll(syn_jit, shifts=(off1, off2), dims=(2, 3))
+            real_jit = torch.roll(real_jit, shifts=(off1, off2), dims=(2, 3))
             # forward pass
-            optimizer.zero_grad()
-            outputs = model_teacher(inputs_jit)
+            #optimizer.zero_grad()
+            #不知道embed和fc是否可用
+            real_embed = model_teacher.embed(real_jit)
+            real_outputs = model_teacher.fc(real_embed)
 
-            # R_cross classification loss
-            loss_ce = criterion(outputs, targets)
+            real_bn_sta = []
+            for bn in loss_r_feature_layers:
+                real_bn_sta.append((bn.mean,bn.var))
 
-            # R_feature loss
+            syn_embed = model_teacher.embed(syn_jit)
+            syn_outputs = model_teacher.fc(syn_embed)
+
+            syn_bn_sta = []
+            for bn in loss_r_feature_layers:
+                syn_bn_sta.append((bn.mean,bn.var))
+
+            loss_bn_temp = [(torch.norm(real_mean - syn_bn_sta[idx][0], 2) + torch.norm(real_var - syn_bn_sta[idx][1], 2)) for (idx,(real_mean,real_var)) in enumerate(real_bn_sta)]
             rescale = [args.first_bn_multiplier] + [1. for _ in range(len(loss_r_feature_layers)-1)]
-            loss_r_bn_feature = sum([mod.r_feature * rescale[idx] for (idx, mod) in enumerate(loss_r_feature_layers)])
+            loss_bn += sum([loss * rescale[idx] for (idx, loss) in enumerate(loss_bn_temp)])
 
-            # R_prior losses
-            _, loss_var_l2 = get_image_prior_losses(inputs_jit)
+            loss_ce += criterion(syn_outputs,torch.full(syn_outputs.shape[0],c))
+            loss_fm += torch.sum((torch.mean(real_embed, dim=0) - torch.mean(syn_embed, dim=0))**2)
+            
+        
 
-            # l2 loss on images
-            loss_l2 = torch.norm(inputs_jit.reshape(batch_size, -1), dim=1).mean()
+        # # R_cross classification loss
+        # loss_ce = criterion(outputs, targets)
 
-            # combining losses
-            loss_aux = args.tv_l2 * loss_var_l2 + \
-                        args.l2_scale * loss_l2 + \
-                        args.r_bn * loss_r_bn_feature
+        # # R_feature loss
+        # rescale = [args.first_bn_multiplier] + [1. for _ in range(len(loss_r_feature_layers)-1)]
+        # loss_r_bn_feature = sum([mod.r_feature * rescale[idx] for (idx, mod) in enumerate(loss_r_feature_layers)])
 
-            loss = loss_ce + loss_aux
+        # # R_prior losses
+        # _, loss_var_l2 = get_image_prior_losses(inputs_jit)
 
-            if iteration % save_every==0:
-                print("------------iteration {}----------".format(iteration))
-                print("total loss", loss.item())
-                print("loss_r_bn_feature", loss_r_bn_feature.item())
-                print("main criterion", criterion(outputs, targets).item())
-                # comment below line can speed up the training (no validation process)
-                if hook_for_display is not None:
-                    hook_for_display(inputs, targets)
+        # # l2 loss on images
+        # loss_l2 = torch.norm(inputs_jit.reshape(batch_size, -1), dim=1).mean()
 
-            # do image update
-            loss.backward()
-            optimizer.step()
+        # # combining losses
+        # loss_aux = args.tv_l2 * loss_var_l2 + \
+        #             args.l2_scale * loss_l2 + \
+        #             args.r_bn * loss_r_bn_feature
 
-            # clip color outlayers
-            inputs.data = clip(inputs.data)
+        loss = loss_ce + loss_bn + loss_fm
 
-            if best_cost > loss.item() or iteration == 1:    #并没有更新best_cost，而且iteration也是从0开始的
-                best_inputs = inputs.data.clone()
+        if iteration % save_every==0:
+            print("------------iteration {}----------".format(iteration))
+            print("total loss", loss.item())
+            # print("loss_r_bn_feature", loss_r_bn_feature.item())
+            # print("main criterion", criterion(outputs, targets).item())
+            # comment below line can speed up the training (no validation process)
+            # if hook_for_display is not None:
+            #     hook_for_display(inputs, targets)
 
-        if args.store_best_images:
-            best_inputs = inputs.data.clone() # using multicrop, save the last one
-            best_inputs = denormalize(best_inputs)
-            save_images(args, best_inputs, targets, ipc_id)
+        # do image update
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-        # to reduce memory consumption by states of the optimizer we deallocate memory
-        optimizer.state = collections.defaultdict(dict)
+        # clip color outlayers
+        image_syn.data = clip(image_syn.data)
+
+        # if best_cost > loss.item() or iteration == 1:    #并没有更新best_cost，而且iteration也是从0开始的
+        #     best_inputs = inputs.data.clone()
+
+    if args.store_best_images:
+        best_inputs = image_syn.data.clone() # using multicrop, save the last one
+        best_inputs = denormalize(best_inputs)
+        save_images(args, best_inputs, label_syn, ipc_id)
+
+    # to reduce memory consumption by states of the optimizer we deallocate memory
+    optimizer.state = collections.defaultdict(dict)
     torch.cuda.empty_cache()
 
 def save_images(args, images, targets, ipc_id):
@@ -205,23 +298,26 @@ def parse_args():
 def main_syn(ipc_id):
     model_teacher = models.__dict__[args.arch_name](pretrained=True)
     model_teacher = nn.DataParallel(model_teacher).cuda()
-    model_teacher.eval()
+    #gai
+    #model_teacher.eval()
     for p in model_teacher.parameters():
         p.requires_grad = False
 
-    model_verifier = models.__dict__[args.verifier_arch](pretrained=True)
-    model_verifier = model_verifier.cuda()
-    model_verifier.eval()
-    for p in model_verifier.parameters():
-        p.requires_grad = False
+    # model_verifier = models.__dict__[args.verifier_arch](pretrained=True)
+    # model_verifier = model_verifier.cuda()
+    # model_verifier.eval()
+    # for p in model_verifier.parameters():
+    #     p.requires_grad = False
 
-    hook_for_display = lambda x,y: validate(x, y, model_verifier)
+    hook_for_display = None#lambda x,y: validate(x, y, model_verifier)
     get_images(args, model_teacher, hook_for_display, ipc_id)
 
 
 if __name__ == '__main__':
     args = parse_args()
     # for ipc_id in range(0,50):
-    for ipc_id in range(args.ipc_start, args.ipc_end):
-        print('ipc = ', ipc_id)
-        main_syn(ipc_id)
+    # for ipc_id in range(args.ipc_start, args.ipc_end):
+    #     print('ipc = ', ipc_id)
+    #     main_syn(ipc_id)
+    #修改
+    main_syn(0)
