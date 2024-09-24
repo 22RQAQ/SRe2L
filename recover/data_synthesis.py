@@ -17,10 +17,10 @@ from torchvision import transforms
 from utils import *
 from torch.utils.data import Dataset
 
-def embed(model, input):
+def embed_qaq(model, input):
     #fc = list(model.children())[-1]
-    embed  = nn.Sequential(*list(model.children())[:-1]).append(nn.Flatten())
-    embeding = embed(input)
+    embed_layer  = nn.Sequential(*list(model.children())[:-1]).add_module('flatten',nn.Flatten())
+    embeding = embed_layer(input)
     #print(embeding.shape)
     #print(fc)
     #print()
@@ -49,7 +49,9 @@ def get_images(args, model_teacher, hook_for_display, ipc_id):
 
     loss_r_feature_layers = []
     for module in model_teacher.modules():
+        #print(module)
         if isinstance(module, nn.BatchNorm2d):
+            #print(module)
             loss_r_feature_layers.append(BNFeatureHook(module))
 
     # setup target labels
@@ -147,13 +149,18 @@ def get_images(args, model_teacher, hook_for_display, ipc_id):
             # forward pass
             #optimizer.zero_grad()
             #不知道embed和fc是否可用
-            real_embed = embed(model_teacher,real_jit)
-
+            #print(model_teacher)
+            embed_layer = nn.Sequential(*list(model_teacher.children())[:-1])
+            embed_layer.add_module('flatten',nn.Flatten())
+            #print(embed_layer)
+            real_embed = embed_layer(real_jit)
+            #print(real_embed.shape)
+            
             real_bn_sta = []
             for bn in loss_r_feature_layers:
                 real_bn_sta.append((bn.mean,bn.var))
 
-            syn_embed = model_teacher.embed(syn_jit)
+            syn_embed = embed_layer(syn_jit)
             #syn_outputs = model_teacher.fc(syn_embed)
 
             syn_bn_sta = []
