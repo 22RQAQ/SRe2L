@@ -17,6 +17,17 @@ from torchvision import transforms
 from utils import *
 from torch.utils.data import Dataset
 
+def embed(model, input):
+    #fc = list(model.children())[-1]
+    embed  = nn.Sequential(*list(model.children())[:-1]).append(nn.Flatten())
+    embeding = embed(input)
+    #print(embeding.shape)
+    #print(fc)
+    #print()
+    #print(embed)
+    return embeding#,fc(embeding)
+    
+
 class TensorDataset(Dataset):
     def __init__(self, images, labels): # images: n x c x h x w tensor
         self.images = images.detach().float()
@@ -117,7 +128,7 @@ def get_images(args, model_teacher, hook_for_display, ipc_id):
             transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
         ])
-        loss_ce,loss_fm,loss_bn = torch.tensor(0.0).cuda()
+        loss_fm,loss_bn = torch.tensor(0.0).cuda(),torch.tensor(0.0).cuda()
 
         for c in range(num_classes):
             idx_shuffle = np.random.permutation(indices_class[c])[:real_batch]
@@ -136,15 +147,14 @@ def get_images(args, model_teacher, hook_for_display, ipc_id):
             # forward pass
             #optimizer.zero_grad()
             #不知道embed和fc是否可用
-            real_embed = model_teacher.embed(real_jit)
-            real_outputs = model_teacher.fc(real_embed)
+            real_embed = embed(model_teacher,real_jit)
 
             real_bn_sta = []
             for bn in loss_r_feature_layers:
                 real_bn_sta.append((bn.mean,bn.var))
 
             syn_embed = model_teacher.embed(syn_jit)
-            syn_outputs = model_teacher.fc(syn_embed)
+            #syn_outputs = model_teacher.fc(syn_embed)
 
             syn_bn_sta = []
             for bn in loss_r_feature_layers:
@@ -154,7 +164,7 @@ def get_images(args, model_teacher, hook_for_display, ipc_id):
             rescale = [args.first_bn_multiplier] + [1. for _ in range(len(loss_r_feature_layers)-1)]
             loss_bn += sum([loss * rescale[idx] for (idx, loss) in enumerate(loss_bn_temp)])
 
-            loss_ce += criterion(syn_outputs,torch.full(syn_outputs.shape[0],c))
+            #loss_ce += criterion(syn_outputs,torch.full(syn_outputs.shape[0],c))
             loss_fm += torch.sum((torch.mean(real_embed, dim=0) - torch.mean(syn_embed, dim=0))**2)
             
         
@@ -177,13 +187,13 @@ def get_images(args, model_teacher, hook_for_display, ipc_id):
         #             args.l2_scale * loss_l2 + \
         #             args.r_bn * loss_r_bn_feature
 
-        loss = loss_ce + loss_bn + loss_fm
+        loss =   loss_bn + loss_fm  #+loss_ce
 
         if iteration % save_every==0:
             print("------------iteration {}----------".format(iteration))
             print("total loss", loss.item())
-            # print("loss_r_bn_feature", loss_r_bn_feature.item())
-            # print("main criterion", criterion(outputs, targets).item())
+            print("loss_r_bn_feature", loss_bn.item())
+            print("feature loss", loss_fm.item())
             # comment below line can speed up the training (no validation process)
             # if hook_for_display is not None:
             #     hook_for_display(inputs, targets)
@@ -297,7 +307,13 @@ def parse_args():
 
 def main_syn(ipc_id):
     model_teacher = models.__dict__[args.arch_name](pretrained=True)
-    model_teacher = nn.DataParallel(model_teacher).cuda()
+    model_teacher = model_teacher.cuda()
+    #print('test')
+    #fe,logits = embed(model_teacher,torch.randn(size=(2, 3, 64, 64), dtype=torch.float, requires_grad=True, device=torch.device('cuda')))
+    #print(fe.shape,fe)
+    #print(logits.shape,logits)
+    #print('finish')
+    #exit()
     #gai
     #model_teacher.eval()
     for p in model_teacher.parameters():
